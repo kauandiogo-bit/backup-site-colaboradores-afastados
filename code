@@ -1,0 +1,157 @@
+/**
+ * Consulta de Afastados — Backend (Google Apps Script)
+ * Somente leitura. Nenhuma função escreve em planilha.
+ *
+ * SUPOSIÇÕES (conservadoras):
+ *  - Status Hik = coluna J da aba AFASTADOS (TRATADO / NOVO / vazio). A coluna G não é usada.
+ *  - Cabeçalho na linha 1 de todas as abas; dados a partir da linha 2.
+ *  - A aba TRATADOS não tem coluna de data, então não há filtro de data nela.
+ *  - Aba DASH é apenas lida e exibida como tabela no final do Dashboard.
+ *  - Planilha = a que contém este script (container-bound). Se o script for avulso,
+ *    preencha PLANILHA_ID abaixo.
+ */
+
+const CFG = {
+  PLANILHA_ID: '',              // opcional: ID da planilha, se o script não estiver vinculado a ela
+  ABAS: { AF: 'AFASTADOS', TR: 'TRATADOS', DASH: 'DASH', USR: 'USR' },
+  TTL: 300,                     // cache em segundos (~5 min)
+  CHUNK: 30000                  // caracteres por pedaço (limite do CacheService: 100 KB por chave)
+};
+
+/** Entrada do web app. Só entrega a página; os dados só saem pelas funções protegidas. */
+function doGet() {
+  return HtmlService.createHtmlOutputFromFile('Index')
+    .setTitle('Consulta de Afastados')
+    .addMetaTag('viewport', 'width=device-width, initial-scale=1')
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+}
+
+/* ====================== ACESSO ====================== */
+
+/** Lança erro se o e-mail não estiver na aba USR (coluna B). Retorna o usuário. */
+function validarAcesso_() {
+  const email = String(Session.getActiveUser().getEmail() || '').trim().toLowerCase();
+  if (!email) throw new Error('NAO_AUTORIZADO');
+  const linhas = lerAba_(CFG.ABAS.USR, 'us');
+  for (const r of linhas) {
+    if (String(r[1] || '').trim().toLowerCase() === email) {
+      return { nome: String(r[0] || '').trim(), email: email, cargo: String(r[2] || '').trim() };
+    }
+  }
+  throw new Error('NAO_AUTORIZADO');
+}
+
+/** Chamada pelo frontend. Retorna o usuário ou lança NAO_AUTORIZADO. */
+function validarAcesso() { return validarAcesso_(); }
+
+/* ====================== DADOS ====================== */
+
+function getAfastados() {
+  validarAcesso_();
+  return lerAba_(CFG.ABAS.AF, 'af').map(function (r) {
+    return {
+      rm: s_(r[0]), ini: d_(r[1]), fim: d_(r[2]), mat: s_(r[3]), nome: s_(r[4]),
+      loc: s_(r[5]), dias: s_(r[7]), anos: s_(r[8]),
+      hik: s_(r[9]).toUpperCase()          // coluna J = Status Hik
+    };
+  }).filter(function (o) { return o.nome || o.mat; });
+}
+
+function getTratados() {
+  validarAcesso_();
+  return lerAba_(CFG.ABAS.TR, 'tr').map(function (r) {
+    return { mat: s_(r[0]), nome: s_(r[1]), trat: s_(r[2]).toUpperCase() };
+  }).filter(function (o) { return o.nome || o.mat; });
+}
+
+/** Dados auxiliares do dashboard (USR agregado + aba DASH somente leitura). */
+function getDashboard() {
+  validarAcesso_();
+  const usr = lerAba_(CFG.ABAS.USR, 'us');
+  const mapa = {};
+  let total = 0;
+  usr.forEach(function (r) {
+    if (!s_(r[1])) return;
+    total++;
+    const c = s_(r[2]) || 'Sem cargo';
+    mapa[c] = (mapa[c] || 0) + 1;
+  });
+  const cargos = Object.keys(mapa).map(function (c) { return { cargo: c, qtd: mapa[c] }; })
+    .sort(function (a, b) { return b.qtd - a.qtd; });
+
+  let dash = null, avisoDash = '';
+  try {
+    const sh = abrir_().getSheetByName(CFG.ABAS.DASH);
+    if (!sh) throw new Error('Aba "' + CFG.ABAS.DASH + '" não encontrada.');
+    const cache = cacheGet_('dash');
+    if (cache) dash = cache;
+    else {
+      const lr = Math.min(sh.getLastRow(), 200), lc = Math.min(sh.getLastColumn(), 20);
+      dash = lr && lc ? sh.getRange(1, 1, lr, lc).getDisplayValues() : [];
+      cachePut_('dash', dash);
+    }
+  } catch (e) { avisoDash = e.message; }
+
+  return { usuariosTotal: total, cargos: cargos, dash: dash, avisoDash: avisoDash };
+}
+
+/** Limpa o cache manualmente (use após editar as planilhas). */
+function limparCache() {
+  validarAcesso_();
+  const c = CacheService.getScriptCache();
+  ['af', 'tr', 'us', 'dash'].forEach(function (k) { c.remove(k + '_n'); });
+  return true;
+}
+
+/* ====================== HELPERS ====================== */
+
+function abrir_() {
+  const ss = CFG.PLANILHA_ID ? SpreadsheetApp.openById(CFG.PLANILHA_ID) : SpreadsheetApp.getActiveSpreadsheet();
+  if (!ss) throw new Error('Planilha não encontrada. Verifique o script ou preencha PLANILHA_ID.');
+  return ss;
+}
+
+/** Lê aba (sem cabeçalho) com cache. Lança erro claro se a aba não existir. */
+function lerAba_(nome, chave) {
+  const em = cacheGet_(chave);
+  if (em) return em;
+  const sh = abrir_().getSheetByName(nome);
+  if (!sh) throw new Error('Aba "' + nome + '" não encontrada na planilha.');
+  const lr = sh.getLastRow(), lc = sh.getLastColumn();
+  const dados = lr > 1 ? sh.getRange(2, 1, lr - 1, lc).getValues() : [];
+  const lim = dados.map(function (r) { return r.map(function (v) { return v instanceof Date ? d_(v) : v; }); });
+  cachePut_(chave, lim);
+  return lim;
+}
+
+function s_(v) { return v === null || v === undefined ? '' : String(v).trim(); }
+
+/** Normaliza data para dd/MM/yyyy (aceita Date ou texto). */
+function d_(v) {
+  if (v instanceof Date) return isNaN(v) ? '' : Utilities.formatDate(v, Session.getScriptTimeZone(), 'dd/MM/yyyy');
+  const t = s_(v);
+  const m = t.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  return m ? m[3] + '/' + m[2] + '/' + m[1] : t;
+}
+
+function cachePut_(k, obj) {
+  try {
+    const s = JSON.stringify(obj), c = CacheService.getScriptCache(), n = Math.max(1, Math.ceil(s.length / CFG.CHUNK)), m = {};
+    m[k + '_n'] = String(n);
+    for (let i = 0; i < n; i++) m[k + '_' + i] = s.substr(i * CFG.CHUNK, CFG.CHUNK);
+    c.putAll(m, CFG.TTL);
+  } catch (e) { /* cache é opcional */ }
+}
+
+function cacheGet_(k) {
+  try {
+    const c = CacheService.getScriptCache(), n = c.get(k + '_n');
+    if (!n) return null;
+    const keys = [];
+    for (let i = 0; i < Number(n); i++) keys.push(k + '_' + i);
+    const p = c.getAll(keys);
+    let s = '';
+    for (const key of keys) { if (p[key] == null) return null; s += p[key]; }
+    return JSON.parse(s);
+  } catch (e) { return null; }
+}
